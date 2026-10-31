@@ -1,10 +1,7 @@
 #!/bin/bash
 nc_port=1234                
-target="Assignment 2"       
-tmp=$(mktemp -d)           
-
-trap 'pkill -P $$ 2>/dev/null; rm -rf "$tmp"' EXIT
-trap 'exit 1' INT TERM
+pool=16                      
+target="Assignment 2"        
 
 fail() { echo "Error: $*" >&2; echo "Error: $*"; }
 
@@ -14,10 +11,20 @@ if [ -z "$IP" ]; then
     exit 1
 fi
 
-if ss -ltn | awk '$1 == "LISTEN" {print $4}' | grep -q ":$nc_port$"; then
-    echo "Error: port $nc_port is already in use (is another server.sh running? stop it with Ctrl+C or: pkill nc)"
+if ss -ltn | grep -q ":$nc_port "; then
+    echo "Error: port $nc_port is already in use (is another server.sh still running? stop it with Ctrl+C, or run: pkill -f server.sh; pkill nc)"
     exit 1
 fi
+
+tmp=$(mktemp -d)             
+
+cleanup() {
+    pkill -P $$ 2>/dev/null
+    pkill -f "nc -N -n -v -l $nc_port" 2>/dev/null
+    rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
 
 handle_assignment() {
     url="https://www.sydney.edu.au/units/INFO1112/2026-S2C-ND-CC"
@@ -84,8 +91,7 @@ handle_population() {
 
     python3 - "$pop_data" "$tmp/$PNG" 2> "$tmp/py.err" <<'PY'
 
-# AI acknowledgement: this plotting script was generated with DeepseekAI and then
-# adapted (it now reads the year,population pairs that server.sh extracted with Bash).
+# AI acknowledgement: this plotting script was generated with DeepseekAI 
 import sys, csv
 import matplotlib
 matplotlib.use("Agg")
@@ -115,110 +121,159 @@ PY
 }
 
 handle_whereami() {
-    req="$1"
     pois_file="neighbours.json"
-    IFS='|' read -r _ place dist <<< "$req"
-    dist=${dist:-5000}
+    poi_url="https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_POI/MapServer/0/query"
+    poi_name=""                                
 
     if [[ "$place" =~ ^-?[0-9.]+,-?[0-9.]+$ ]]; then
+        # the client sent coordinates:  latitude,longitude
         lat=${place%,*}
         lon=${place#*,}
     else
-        geo=$(curl -sf -A "info1112-a2-student" -G "https://nominatim.openstreetmap.org/search" \
-              --data-urlencode "q=$place" -d "format=json" -d "limit=1")
-        lat=$(echo "$geo" | jq -r '.[0].lat // empty')
-        lon=$(echo "$geo" | jq -r '.[0].lon // empty')
+        name_sql=${place//\'/\'\'}
+        name_sql=${name_sql^^}
+        lat=""
+        lon=""
+        for condition in "poiname='$name_sql'" "poiname LIKE '%$name_sql%'"; do
+            found=$(curl -sfG "$poi_url" \
+                --data-urlencode "where=$condition" \
+                -d "outFields=poiname" -d "returnGeometry=true" -d "outSR=4326" \
+                -d "resultRecordCount=1" -d "f=json") || { fail "could not reach the NSW POI service"; return; }
+            lat=$(echo "$found" | jq -r '.features[0].geometry.y // empty')
+            lon=$(echo "$found" | jq -r '.features[0].geometry.x // empty')
+            poi_name=$(echo "$found" | jq -r '.features[0].attributes.poiname // empty')
+            [ -n "$lat" ] && break
+        done
         if [ -z "$lat" ] || [ -z "$lon" ]; then
-            fail "POI '$place' was not found"
+            fail "POI '$place' was not found in the NSW Points of Interest data"
             return
         fi
     fi
+    result=$(curl -sfG "$poi_url" \
+        --data-urlencode "geometry=$lon,$lat" -d "geometryType=esriGeometryPoint" -d "inSR=4326" \
+        -d "spatialRel=esriSpatialRelIntersects" -d "distance=$dist" -d "units=esriSRUnit_Meter" \
+        -d "where=1=1" -d "outFields=poiname,poitype" -d "returnGeometry=false" \
+        -d "resultRecordCount=1000" -d "f=json") || { fail "could not reach the NSW POI service"; return; }
 
-    query="[out:json][timeout:25];node(around:$dist,$lat,$lon)[\"name\"][\"tourism\"];out;"
-    result=$(curl -sf "https://overpass-api.de/api/interpreter" --data-urlencode "data=$query")
-    if [ -z "$result" ]; then
-        fail "could not get neighbouring POIs (service unreachable)"
+    names=$(echo "$result" | jq -c --arg self "$poi_name" \
+            '[.features[].attributes.poiname] | map(select(. != null and . != $self)) | unique' 2> /dev/null)
+    if [ -z "$names" ]; then
+        fail "the NSW POI service did not return a list of POIs: $(echo "$result" | head -c 200)"
         return
     fi
+    if [ "$(echo "$result" | jq -r '.exceededTransferLimit // false')" = "true" ]; then
+        echo "Note: more than 1000 POIs found - the list is limited to the first 1000" >&2
+    fi
 
-    names=$(echo "$result" | jq -c '[.elements[].tags.name] | unique')
     jq -n --arg poi "$place" --argjson distance "$dist" --argjson neighbours "$names" \
-        '{poi: $poi, distance_m: $distance, neighbours: $neighbours}' > "$tmp/$pois_file"
+        '{poi: $poi, distance_m: $distance, count: ($neighbours | length), neighbours: $neighbours}' \
+        > "$tmp/$pois_file"
     mv "$tmp/$pois_file" "$pois_file"
     echo "Created $pois_file:" >&2
     cat "$pois_file" >&2
 }
 
-
-start_job() {
-    outfile="$1"
-    shift
-    # Test case B: this client already has a job running -> reject
-    if [ -e "$lock" ]; then
+run_job() {
+    outfile="$1"                       
+    job="$2"                           
+    if [ -s "$lock" ] && kill -0 "$(cat "$lock")" 2>/dev/null; then
         fail "server is busy with another request from $client_ip - this request was rejected"
         return
     fi
-    touch "$lock"
-    # the job runs in the background (&); the lock file is removed when it is finished
-    ( sleep "${TEST_DELAY:-0}"; "$@"; rm -f "$lock" ) > /dev/null < /dev/null &
-    echo "OK: request accepted and running in the background."
-    echo "When it has finished, download the result with:  echo 'get $outfile' | nc <server-ip> $nc_port > $outfile"
+    echo "$BASHPID" > "$lock"           
+    rm -f "$outfile"
+    sleep "${TEST_DELAY:-0}"            # for testing only: TEST_DELAY=10 bash server.sh
+    $job
+    rm -f "$lock"                       
+    if [ -s "$outfile" ]; then
+        cat "$outfile"                 
+    fi
 }
 
-send_file() {
-    case "$1" in
-        assignment.json|population.png|neighbours.json) ;;
-        *) fail "unknown file '$1' (available: assignment.json, population.png, neighbours.json)"; return ;;
-    esac
-    if [ ! -s "$1" ]; then
-        fail "$1 is not ready yet (the job may still be running, or it failed - see the server screen)"
-        return
+read_poi_request() {
+    poi="$1"
+    if echo "$poi" | grep -qi '^where am i'; then
+        poi=$(echo "$poi" | cut -c11- | sed 's/^[?:| ]*//')
     fi
-    cat "$1"
+
+    dist=""
+    if echo "$poi" | grep -qi 'distance *= *[0-9]'; then
+        dist=$(echo "$poi" | grep -oiE 'distance *= *[0-9]+' | grep -oE '[0-9]+')
+        poi=$(echo "$poi" | sed -E 's/[Dd]istance *= *[0-9]+//')
+    elif echo "$poi" | grep -q '|'; then
+        dist=$(echo "$poi" | awk -F'|' '{print $NF}' | tr -d ' ')
+        poi=$(echo "$poi" | sed 's/|[^|]*$//')
+    fi
+    if [ -z "$dist" ]; then dist=5000; fi
+    place=$(echo "$poi" | tr -d '|' | sed 's/^ *//; s/ *$//')
+
+    if echo "$place" | grep -qE '^-?[0-9.]+ *, *-?[0-9.]+$'; then
+        place=$(echo "$place" | tr -d ' ' | awk -F, '{ if ($1 > 0 && $2 < 0) print $2 "," $1; else print $1 "," $2 }')
+    fi
 }
 
 handle_request() {
-    read -r request || true                   
-    request=${request%$'\r'}
+    id="$1"
+    read -r request                                                     
+    request=$(echo "$request" | tr -d '\r' | sed 's/^ *//; s/ *$//')   
+    lower=$(echo "$request" | tr 'A-Z' 'a-z')
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [ -s "$tmp/ip_$id" ]; then break; fi
+        sleep 0.05
+    done
+    if [ ! -s "$tmp/ip_$id" ]; then exit 0; fi
 
-    cat "$tmp/nc_info" >&2                     
-    client_ip=$(awk '/Connection received/ {print $4}' "$tmp/nc_info")
+    client_ip=$(cat "$tmp/ip_$id")
     lock="$tmp/busy_$client_ip"
 
-    if [ -z "$request" ]; then
-        fail "empty request received"
-    elif [[ "$request" == "get "* ]]; then
-        send_file "${request#get }"
-    elif [ "$request" = "assignment" ]; then
-        start_job assignment.json handle_assignment
-    elif [ "$request" = "population" ]; then
-        start_job population.png handle_population
-    elif [[ "$request" == "where am I"* ]]; then
-        IFS='|' read -r _ place dist <<< "$request"
-        if [ -z "$place" ]; then
-            fail "usage: where am I|<place name or lat,lon>|<distance in metres>"
-        elif ! [[ "${dist:-5000}" =~ ^[0-9]+$ ]]; then
-            fail "distance must be a whole number of metres"
-        else
-            start_job neighbours.json handle_whereami "$request"
-        fi
+    if [ "$lower" = "assignment" ] || [ "$lower" = "asssignment" ]; then   # (the rubric's example has 3 s's)
+        run_job assignment.json handle_assignment
+    elif [ "$lower" = "population" ]; then
+        run_job population.png handle_population
     else
-        fail "invalid request '$request' (try: assignment, population, where am I|<place>|<metres>, or get <file>)"
+        read_poi_request "$request"
+        if [ -z "$place" ] || ! echo "$dist" | grep -qE '^[0-9]+$'; then
+            fail "send: assignment, population, or a POI name or lat,lon with an optional distance in metres, e.g. FISHER LIBRARY SYDNEY UNIVERSITY|5000"
+        else
+            run_job neighbours.json handle_whereami
+        fi
     fi
 }
 
-mkfifo "$tmp/reply_pipe"
+on_nc_message() {
+    id="$1"
+    while read -r line; do
+        case "$line" in
+            "Listening on"*)
+                if [ "$id" = "init1" ]; then echo "$line" > "$tmp/listening_line"; fi ;;
+            "Connection received"*)
+                echo "$line" | awk '{print $4}' > "$tmp/ip_$id"       
+                echo "$line" >&2                                      
+                serve_one "$BASHPID" > /dev/null < /dev/null &        
+                ;;
+            *) echo "$line" >&2 ;;                                    
+        esac
+    done
+}
 
-(
-    sleep 0.5
-    port=$(ss -ltn | awk '$1 == "LISTEN" {print $4}' | sed 's/.*://' | head -n 1)
-    echo "The server is running at $IP, port=$port"
-) &
+serve_one() {
+    id="$1"
+    mkfifo "$tmp/pipe_$id" "$tmp/msg_$id"
+    on_nc_message "$id" < "$tmp/msg_$id" &
+    nc -N -n -v -l "$nc_port" < "$tmp/pipe_$id" 2> "$tmp/msg_$id" | handle_request "$id" > "$tmp/pipe_$id"
+    rm -f "$tmp/pipe_$id" "$tmp/msg_$id"
+}
 
-while true; do
-    nc -N -n -v -l "$nc_port" < "$tmp/reply_pipe" 2> "$tmp/nc_info" | handle_request > "$tmp/reply_pipe" &
-    wait
+i=1
+while [ "$i" -le "$pool" ]; do
+    serve_one "init$i" > /dev/null < /dev/null &
+    i=$((i + 1))
 done
 
+port=$(ss -ltnp | grep '"nc"' | awk '{print $4}' | sed 's/.*://' | head -n 1)
+echo "The server is running at $IP, port=$port"
+cat "$tmp/listening_line" >&2
 
-
+while true; do
+    sleep 1
+done
