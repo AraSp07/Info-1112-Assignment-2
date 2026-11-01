@@ -270,6 +270,7 @@ while [ "$i" -le "$pool" ]; do
     i=$((i + 1))
 done
 
+sleep 1
 port=$(ss -ltnp | grep '"nc"' | awk '{print $4}' | sed 's/.*://' | head -n 1)
 echo "The server is running at $IP, port=$port"
 cat "$tmp/listening_line" >&2
