@@ -137,8 +137,9 @@ handle_whereami() {
         for condition in "poiname='$name_sql'" "poiname LIKE '%$name_sql%'"; do
             found=$(curl -sfG "$poi_url" \
                 --data-urlencode "where=$condition" \
-                -d "outFields=poiname" -d "returnGeometry=true" -d "outSR=4326" \
-                -d "resultRecordCount=1" -d "f=json") || { fail "could not reach the NSW POI service"; return; }
+                -d "outFields=poiname" -d "returnGeometry=true" \
+                -d "f=json") || { fail "could not reach the NSW POI service"; return; }
+
             lat=$(echo "$found" | jq -r '.features[0].geometry.y // empty')
             lon=$(echo "$found" | jq -r '.features[0].geometry.x // empty')
             poi_name=$(echo "$found" | jq -r '.features[0].attributes.poiname // empty')
@@ -153,7 +154,7 @@ handle_whereami() {
         --data-urlencode "geometry=$lon,$lat" -d "geometryType=esriGeometryPoint" -d "inSR=4326" \
         -d "spatialRel=esriSpatialRelIntersects" -d "distance=$dist" -d "units=esriSRUnit_Meter" \
         -d "where=1=1" -d "outFields=poiname,poitype" -d "returnGeometry=false" \
-        -d "resultRecordCount=1000" -d "f=json") || { fail "could not reach the NSW POI service"; return; }
+        -d "f=json") || { fail "could not reach the NSW POI service"; return; }
 
     names=$(echo "$result" | jq -c --arg self "$poi_name" \
             '[.features[].attributes.poiname] | map(select(. != null and . != $self)) | unique' 2> /dev/null)
