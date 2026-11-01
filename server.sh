@@ -93,7 +93,7 @@ handle_population() {
 
     python3 - "$pop_data" "$tmp/$PNG" 2> "$tmp/py.err" <<'PY'
 
-# AI acknowledgement: this plotting script was generated with DeepseekAI 
+# AI acknowledgement: this plotting script was generated with DeepseekAI V4 and modified by me to fit the assignment 
 import sys, csv
 import matplotlib
 matplotlib.use("Agg")
