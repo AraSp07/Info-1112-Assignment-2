@@ -1,17 +1,15 @@
  # INFO1112 Assignment 2 - server.sh
 
-Run inside the Alpine container:  bash server.sh   (stop with Ctrl+C)
-
 There is no client.sh file in my assignment. Clients use nc as in the spec, e.g.
     echo asssignment | nc 172.17.0.2 1234
     echo population | nc 172.17.0.2 1234 > population.png
     echo "FISHER LIBRARY SYDNEY UNIVERSITY" | nc 172.17.0.2 1234
 The reply comes back on the same connection. If a client closes too early, keep it open with sleep (echo assignment; sleep 5) | nc localhost 1234
 
-A POI request is a POI name or latitude,longitude, optionally with a distance
+I have specified a POI request as a POI name or latitude,longitude, optionally with a distance
 in metres (default 5000), e.g.  -33.8868,151.1897|500
 
-Code for testcases have been written in server.sh 
+Code for testcases have been written in server.sh, screenshots named client are from client terminal and server are from server terminal. 
 
 Test case A (server not running): see screenshots - nc fails
 (Connection refused) while ping shows the container is reachable.
