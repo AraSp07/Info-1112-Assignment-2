@@ -18,6 +18,8 @@ fi
 
 tmp=$(mktemp -d)             
 
+# Test case A: when the server is stopped (Ctrl+C or kill), this stops every nc listener
+# and removes the temp files, so the port is really closed and a client's nc fails.
 cleanup() {
     pkill -P $$ 2>/dev/null
     pkill -f "nc -N -n -v -l $nc_port" 2>/dev/null
@@ -174,6 +176,8 @@ handle_whereami() {
     cat "$pois_file" >&2
 }
 
+# Test case B: if this client's IP already has a job running (the lock file exists and its
+# process is still alive), the new request is rejected with an error message.
 run_job() {
     outfile="$1"                       
     job="$2"                           
@@ -241,6 +245,9 @@ handle_request() {
     fi
 }
 
+# Test case B (continued): one nc can only serve one client at a time, so whenever a client
+# connects a replacement listener is started. That way a second request from the same client
+# can still be accepted and rejected while the first one is running.
 on_nc_message() {
     id="$1"
     while read -r line; do
